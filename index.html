@@ -906,44 +906,125 @@ function buildQualityList(levels, currentLevel) {
   });
 }
 
-function loadStream(url) {
+// CORS proxies tried in order
+const PROXIES = [
+  u => `https://corsproxy.io/?url=${encodeURIComponent(u)}`,
+  u => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`,
+  u => `https://cors-anywhere.herokuapp.com/${u}`,
+  u => `https://thingproxy.freeboard.io/fetch/${u}`,
+];
+
+let currentBlobUrl = null;
+let rawUrl = '';
+
+// Fetch manifest text through a working proxy, rewriting segment URLs
+async function fetchViaProxy(originalUrl) {
+  // Try each proxy in sequence
+  for (let i = 0; i < PROXIES.length; i++) {
+    const proxyUrl = PROXIES[i](originalUrl);
+    setOverlay(true, true, i === 0 ? 'Connecting…' : `Trying proxy ${i + 1}/${PROXIES.length}…`);
+    try {
+      const res = await fetch(proxyUrl, { signal: AbortSignal.timeout(8000) });
+      if (!res.ok) continue;
+      const text = await res.text();
+      if (!text.includes('#EXTM3U')) continue;
+      // Rewrite relative URLs in the playlist so HLS.js can fetch segments via same proxy
+      const base = originalUrl.substring(0, originalUrl.lastIndexOf('/') + 1);
+      const rewritten = rewritePlaylist(text, base, PROXIES[i]);
+      return rewritten;
+    } catch (e) { /* try next */ }
+  }
+  throw new Error('All proxies failed — the stream may be offline or geo-blocked.');
+}
+
+function rewritePlaylist(text, base, proxyFn) {
+  return text.split('\n').map(line => {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) return line;
+    // Make absolute
+    const absUrl = trimmed.startsWith('http') ? trimmed : base + trimmed;
+    // Proxy it
+    return proxyFn(absUrl);
+  }).join('\n');
+}
+
+async function loadStream(url) {
   if (!url.trim()) return;
+  rawUrl = url.trim();
   hideError();
-  setOverlay(true, true, 'Loading stream…');
+  setOverlay(true, true, 'Connecting…');
 
   if (hls) { hls.destroy(); hls = null; }
+  if (currentBlobUrl) { URL.revokeObjectURL(currentBlobUrl); currentBlobUrl = null; }
   video.pause();
 
-  if (Hls.isSupported()) {
-    hls = new Hls({
-      enableWorker: true,
-      lowLatencyMode: true,
-      backBufferLength: 90,
-      maxBufferLength: 30,
-      maxMaxBufferLength: 600,
-      startLevel: -1,
-    });
+  if (!Hls.isSupported() && !video.canPlayType('application/vnd.apple.mpegurl')) {
+    showError('HLS is not supported in this browser.');
+    setOverlay(true, false, 'Not supported');
+    return;
+  }
 
-    hls.loadSource(url);
-    hls.attachMedia(video);
-
-    hls.on(Hls.Events.MANIFEST_PARSED, (e, data) => {
-      hideError();
-      buildQualityList(hls.levels, hls.currentLevel);
-
-      isLive = hls.levels.some(l => l.details && l.details.live);
-      if (hls.config.lowLatencyMode) isLive = true;
-
-      video.play().then(() => {
-        setOverlay(false);
-        updatePlayIcon(true);
-      }).catch(() => {
-        setOverlay(true, false, 'Click to play');
+  // Strategy 1: try direct load first (works if the server sends CORS headers)
+  // Strategy 2: fetch manifest ourselves via proxy and feed as Blob URL
+  async function tryLoad(src, label) {
+    return new Promise((resolve, reject) => {
+      if (hls) { hls.destroy(); }
+      hls = new Hls({
+        enableWorker: true,
+        lowLatencyMode: false,
+        backBufferLength: 60,
+        maxBufferLength: 30,
+        maxMaxBufferLength: 300,
+        startLevel: -1,
+        manifestLoadingTimeOut: 10000,
+        manifestLoadingMaxRetry: 0,
       });
 
-      liveBadge.style.display = isLive ? 'flex' : 'none';
-      liveIndicator.style.display = isLive ? 'flex' : 'none';
+      let settled = false;
+      function done(ok, err) {
+        if (settled) return;
+        settled = true;
+        ok ? resolve() : reject(err);
+      }
+
+      hls.loadSource(src);
+      hls.attachMedia(video);
+
+      hls.on(Hls.Events.MANIFEST_PARSED, () => done(true));
+      hls.on(Hls.Events.ERROR, (e, data) => {
+        if (data.fatal && data.type === Hls.ErrorTypes.NETWORK_ERROR) done(false, data.details);
+      });
+
+      setTimeout(() => done(false, 'timeout'), 12000);
     });
+  }
+
+  // Attempt 1: direct
+  try {
+    setOverlay(true, true, 'Connecting directly…');
+    await tryLoad(rawUrl, 'direct');
+    onSuccess();
+    return;
+  } catch (e) { /* fall through to proxy */ }
+
+  // Attempt 2: proxy the manifest ourselves
+  try {
+    const manifestText = await fetchViaProxy(rawUrl);
+    const blob = new Blob([manifestText], { type: 'application/vnd.apple.mpegurl' });
+    currentBlobUrl = URL.createObjectURL(blob);
+    await tryLoad(currentBlobUrl, 'proxy');
+    onSuccess();
+    return;
+  } catch (e) {
+    if (hls) { hls.destroy(); hls = null; }
+    showError(typeof e === 'string' ? e : (e.message || 'Stream could not be loaded'));
+    setOverlay(true, false, 'Failed to load stream');
+  }
+
+  function onSuccess() {
+    hideError();
+    buildQualityList(hls.levels, hls.currentLevel);
+    isLive = !isFinite(video.duration) || video.duration > 3600 * 10;
 
     hls.on(Hls.Events.LEVEL_SWITCHED, (e, data) => {
       if (hls.levels.length > 0) buildQualityList(hls.levels, data.level);
@@ -951,19 +1032,23 @@ function loadStream(url) {
 
     hls.on(Hls.Events.ERROR, (e, data) => {
       if (data.fatal) {
-        showError(`${data.type}: ${data.details}`);
-        setOverlay(true, false, 'Playback error');
-        if (data.type === Hls.ErrorTypes.NETWORK_ERROR) hls.startLoad();
-        else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) hls.recoverMediaError();
+        if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+          hls.recoverMediaError();
+        } else {
+          showError(data.details);
+        }
       }
     });
 
-  } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
-    video.src = url;
-    video.play().then(() => setOverlay(false)).catch(() => setOverlay(true, false, 'Click to play'));
-  } else {
-    showError('HLS is not supported in this browser.');
-    setOverlay(true, false, 'Not supported');
+    video.play().then(() => {
+      setOverlay(false);
+      updatePlayIcon(true);
+    }).catch(() => {
+      setOverlay(true, false, 'Click to play');
+    });
+
+    liveBadge.style.display = isLive ? 'flex' : 'none';
+    liveIndicator.style.display = isLive ? 'flex' : 'none';
   }
 }
 
